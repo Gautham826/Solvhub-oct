@@ -1,0 +1,303 @@
+// SOLVHub Prisma schema
+// The connection URL is read from DATABASE_URL via prisma.config.js.
+// Phase 1: accounts, roles, addresses, service catalogue.
+// Phase 2: provider professional profile, documents and admin verification.
+// Phase 4: service requests, job workflow and provider availability.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// --- Enums -----------------------------------------------
+
+enum Role {
+  CUSTOMER
+  PROVIDER
+  ADMIN
+  REPRESENTATIVE // Assisted Service: submits/handles requests for offline customers
+}
+
+enum AccountStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum ProviderType {
+  PROFESSIONAL // licensed / experienced electrician
+  STUDENT      // ITI / diploma / engineering student or apprentice
+  RETIRED      // retired electrician or electrical professional
+  OTHER        // other qualified specialist (solar, inverter, appliance...)
+}
+
+enum DocumentType {
+  ID_PROOF
+  QUALIFICATION_CERTIFICATE
+  ELECTRICAL_LICENCE // optional
+  PROFILE_PHOTO
+}
+
+enum RequestStatus {
+  REQUESTED   // sent by the customer, waiting for the provider
+  ACCEPTED    // provider accepted, visit scheduled
+  DECLINED    // provider declined
+  IN_PROGRESS // provider started the job
+  COMPLETED   // provider marked the job complete
+  CANCELLED   // customer cancelled before work started
+}
+
+enum RequestUrgency {
+  NORMAL
+  EMERGENCY
+}
+
+enum VerificationStatus {
+  INCOMPLETE // account created, professional profile not submitted yet
+  PENDING    // submitted, waiting for admin review
+  APPROVED   // visible to customers, can receive requests
+  REJECTED
+}
+
+// --- Accounts --------------------------------------------
+
+model User {
+  id           String        @id @default(uuid())
+  fullName     String
+  email        String        @unique
+  phone        String
+  passwordHash String
+  role         Role
+  status       AccountStatus @default(ACTIVE)
+  lastLoginAt  DateTime?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  addresses         Address[]
+  providerProfile   ProviderProfile? @relation("ProviderAccount")
+  reviewedProviders ProviderProfile[] @relation("ProviderReviewer")
+  serviceRequests   ServiceRequest[]  @relation("CustomerRequests")
+  reviews           Review[]          @relation("CustomerReviews")
+
+  @@index([role])
+  @@map("users")
+}
+
+model Address {
+  id        String   @id @default(uuid())
+  userId    String
+  label     String   @default("Home")
+  line1     String
+  landmark  String?
+  city      String
+  state     String
+  pincode   String
+  latitude  Float?
+  longitude Float?
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("addresses")
+}
+
+// Professional profile submitted by a provider and reviewed by an administrator.
+// The provider's base location is stored as their default Address.
+model ProviderProfile {
+  id                 String             @id @default(uuid())
+  userId             String             @unique
+  verificationStatus VerificationStatus @default(INCOMPLETE)
+
+  // Step 2 - professional information
+  providerType    ProviderType?
+  experienceYears Int?
+  workArrangement String? // INDEPENDENT | PROPRIETORSHIP | EMPLOYED
+  bio             String?
+  skills          String[]          @default([])
+  services        ServiceCategory[]
+
+  // Step 3 - qualifications & identity (only the last 4 ID digits are stored)
+  qualification     String?
+  institute         String?
+  idType            String?
+  idNumberLast4     String?
+  licenceNumber     String?
+  licenceAuthority  String?
+  licenceValidUntil DateTime?
+  documents         ProviderDocument[]
+
+  // Step 4 - service area & availability
+  serviceRadiusKm    Int?
+  workingDays        String[] @default([]) // MON..SUN
+  workStartTime      String? // "09:00"
+  workEndTime        String? // "18:00"
+  emergencyAvailable Boolean  @default(false)
+  acceptingRequests  Boolean  @default(true) // provider can pause new requests
+  ratingAverage      Float? // average review rating, one decimal
+  ratingCount        Int      @default(0)
+
+  // Verification
+  submittedAt     DateTime?
+  reviewedAt      DateTime?
+  reviewedById    String?
+  reviewNotes     String?
+  rejectionReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  serviceRequests ServiceRequest[]
+
+  user       User  @relation("ProviderAccount", fields: [userId], references: [id], onDelete: Cascade)
+  reviewedBy User? @relation("ProviderReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviews    Review[]
+
+  @@index([verificationStatus])
+  @@map("provider_profiles")
+}
+
+// Verification documents. Files live in server storage (UPLOAD_DIR) and are only
+// served to the owner and administrators through authenticated endpoints.
+model ProviderDocument {
+  id           String       @id @default(uuid())
+  profileId    String
+  type         DocumentType
+  originalName String
+  storedName   String       @unique
+  mimeType     String
+  sizeBytes    Int
+  createdAt    DateTime     @default(now())
+
+  profile ProviderProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@unique([profileId, type])
+  @@map("provider_documents")
+}
+
+// --- Service catalogue (reference data, seeded) ----------
+
+model ServiceCategory {
+  id          String   @id @default(uuid())
+  slug        String   @unique
+  name        String
+  description String
+  icon        String // Material Symbols icon name
+  group       String // filter group shown on the Services page
+  sortOrder   Int      @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  providers       ProviderProfile[]
+  serviceRequests ServiceRequest[]
+
+  @@map("service_categories")
+}
+
+// --- Service requests & jobs -----------------------------
+
+// A customer's request to one verified provider. The address is copied at
+// creation time so later profile edits never change a past job.
+model ServiceRequest {
+  id          String         @id @default(uuid())
+  reference   String         @unique // e.g. SR-7K3F9Q2A, shown to users
+  customerId  String
+  providerId  String
+  categoryId  String
+  status      RequestStatus  @default(REQUESTED)
+  urgency     RequestUrgency @default(NORMAL)
+  title       String
+  description String
+
+  preferredDate DateTime // date only
+  preferredSlot String // MORNING | AFTERNOON | EVENING | ASAP
+
+  addressLine1 String
+  landmark     String?
+  city         String
+  state        String
+  pincode      String
+  accessNotes  String?
+
+  estimateAmount  Int? // rupees, given when accepting
+  finalAmount     Int? // rupees, given on completion
+  providerNote    String?
+  declineReason   String?
+  cancelReason    String?
+  completionNotes String?
+
+  acceptedAt  DateTime?
+  declinedAt  DateTime?
+  startedAt   DateTime?
+  completedAt DateTime?
+  cancelledAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  customer    User                @relation("CustomerRequests", fields: [customerId], references: [id], onDelete: Cascade)
+  provider    ProviderProfile     @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  category    ServiceCategory     @relation(fields: [categoryId], references: [id])
+  events      RequestEvent[]
+  attachments RequestAttachment[]
+  review      Review?
+
+  @@index([customerId, status])
+  @@index([providerId, status])
+  @@map("service_requests")
+}
+
+// Timeline entry written on every status change.
+model RequestEvent {
+  id        String        @id @default(uuid())
+  requestId String
+  status    RequestStatus
+  actorRole Role
+  note      String?
+  createdAt DateTime      @default(now())
+
+  request ServiceRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@index([requestId])
+  @@map("request_events")
+}
+
+// Photos of the problem uploaded by the customer (private to both parties).
+model RequestAttachment {
+  id           String   @id @default(uuid())
+  requestId    String
+  originalName String
+  storedName   String   @unique
+  mimeType     String
+  sizeBytes    Int
+  createdAt    DateTime @default(now())
+
+  request ServiceRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@index([requestId])
+  @@map("request_attachments")
+}
+
+// A customer's rating of a provider after a completed job (one review per job).
+model Review {
+  id         String   @id @default(uuid())
+  requestId  String   @unique
+  customerId String
+  providerId String
+  rating     Int // 1 to 5
+  comment    String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  request  ServiceRequest  @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  customer User            @relation("CustomerReviews", fields: [customerId], references: [id], onDelete: Cascade)
+  provider ProviderProfile @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId, createdAt])
+  @@index([customerId])
+  @@map("reviews")
+}
